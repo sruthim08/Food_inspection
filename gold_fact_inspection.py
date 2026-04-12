@@ -1,6 +1,6 @@
 from pyspark.sql.functions import (
     col, lit, to_date, monotonically_increasing_id,
-    date_format, upper
+    date_format, upper, concat
 )
 from pyspark.sql.types import IntegerType
 
@@ -29,7 +29,7 @@ chicago_base = (
     .withColumn("street_address", upper(col("address")))
     .withColumn("city_upper", upper(col("city")))
     .withColumn("restaurant_nk",
-        col("source_city").cast("string").concat(lit("|")).concat(col("license_number")))
+        concat(col("source_city"), lit("|"), col("license_number").cast("string")))
     .select(
         "inspection_id",
         "inspection_date",
@@ -57,7 +57,7 @@ dallas_base = (
     .withColumn("source_city", lit("Dallas"))
     .withColumn("city_upper", lit("DALLAS"))
     .withColumn("restaurant_nk",
-        col("source_city").cast("string").concat(lit("|")).concat(col("business_name")))
+        concat(col("source_city"), lit("|"), col("business_name")))
     .select(
         "inspection_id",
         "inspection_date",
@@ -136,31 +136,3 @@ fact_inspection = (
         "source_city",            # 'Chicago' or 'Dallas'
     )
 )
-
-fact_inspection.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("fact_inspection")
-
-print("fact_inspection rows:", fact_inspection.count())
-print("\nChicago rows:", fact_inspection.filter(col("source_city") == "Chicago").count())
-print("Dallas rows:",   fact_inspection.filter(col("source_city") == "Dallas").count())
-
-# ── Validation checks ─────────────────────────────────────────
-print("\n--- Validation: score range by city ---")
-spark.sql("""
-    SELECT source_city,
-           MIN(inspection_score) AS min_score,
-           MAX(inspection_score) AS max_score,
-           COUNT(*) AS total_rows,
-           COUNT(inspection_result) AS rows_with_result
-    FROM fact_inspection
-    GROUP BY source_city
-""").show()
-
-print("\n--- Validation: NULL FK counts (should all be 0) ---")
-spark.sql("""
-    SELECT
-        SUM(CASE WHEN restaurant_sk IS NULL THEN 1 ELSE 0 END) AS null_restaurant_sk,
-        SUM(CASE WHEN location_sk   IS NULL THEN 1 ELSE 0 END) AS null_location_sk,
-        SUM(CASE WHEN date_sk        IS NULL THEN 1 ELSE 0 END) AS null_date_sk,
-        SUM(CASE WHEN inspection_type_sk IS NULL THEN 1 ELSE 0 END) AS null_type_sk
-    FROM fact_inspection
-""").show()
