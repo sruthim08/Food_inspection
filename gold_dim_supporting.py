@@ -1,4 +1,4 @@
-from pyspark.sql.functions import (
+from pyspark.sql.functions import (expr,
     col, lit, upper, to_date, date_format, dayofmonth, month, quarter,
     year, dayofweek, monotonically_increasing_id, when, concat_ws,
     regexp_extract, trim
@@ -20,11 +20,11 @@ chicago_locations = (
     chicago
     .select(
         col("address").alias("street_address"),
-        upper(col("city")).alias("city"),
+        col("city"),
         col("state"),
         col("zip_code"),
-        col("latitude"),
-        col("longitude")
+        expr("try_cast(latitude AS DOUBLE)").alias("latitude"),
+        expr("try_cast(longitude AS DOUBLE)").alias("longitude")
     )
 )
 
@@ -32,7 +32,7 @@ dallas_locations = (
     dallas
     .select(
         col("street_address"),
-        lit("DALLAS").alias("city"),
+        lit("Dallas").alias("city"),
         lit("TX").alias("state"),
         col("zip_code"),
         col("latitude"),

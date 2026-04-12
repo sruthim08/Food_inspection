@@ -1,6 +1,7 @@
 import dlt
 from pyspark.sql.functions import (
-    col, when, lit, to_date, regexp_extract, array, size, filter as array_filter
+    col, when, lit, to_date, regexp_extract, array, size, filter as array_filter,
+    monotonically_increasing_id
 )
 
 @dlt.table(name="silver_chicago")
