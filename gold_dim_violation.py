@@ -1,11 +1,17 @@
 from pyspark.sql.functions import (
     col, explode, split, regexp_extract, lit,
-    lpad, trim, expr, monotonically_increasing_id
+    lpad, trim, monotonically_increasing_id, expr
 )
-from pyspark.sql import functions as F
 
 # ============================================================
-# GOLD - VIOLATION PARSING
+# GOLD - STEP A: Parse violations + build dim_violation
+#
+# Run order:
+#   1. gold_dim_supporting.py       (dim_date, dim_inspection_type, dim_risk)
+#   2. gold_dim_restaurant.py       (dim_restaurant SCD2)
+#   3. THIS FILE                    (dim_violation + staging_all_violations)
+#   4. gold_fact_inspection.py      (fact_inspection)
+#   5. gold_fact_violation.py       (fact_inspection_violation — needs fact_inspection)
 # ============================================================
 
 chicago = spark.table("silver_chicago")
@@ -34,62 +40,70 @@ chicago_violations = (
     .withColumn("violation_points",  lit(None).cast("integer"))
     .withColumn("source_city",       lit("Chicago"))
     .filter(col("violation_code") != "")
-    .select(
-        "inspection_id", "violation_code", "violation_description",
-        "violation_detail", "inspector_comment", "violation_points", "source_city"
-    )
+    .select("inspection_id", "violation_code", "violation_description",
+            "violation_detail", "inspector_comment", "violation_points", "source_city")
     .dropDuplicates(["inspection_id", "violation_code"])
 )
 
 print("Chicago violations parsed:", chicago_violations.count())
-chicago_violations.show(5, truncate=False)
 
 
 # ──────────────────────────────────────────────────────────────
-# STEP 2 — Unpivot Dallas violations from wide to long format
+# STEP 2 — Unpivot Dallas violations
 # ──────────────────────────────────────────────────────────────
 
-# MUST cast all violation_points columns to STRING before stack()
-# because Bronze ingested them with mixed types (some INT, some STRING)
-for i in range(1, 26):
-    dallas = dallas.withColumn(
-        f"violation_points_-_{i}",
-        col(f"violation_points_-_{i}").cast("string")
+def build_dallas_stack_expr(n=25):
+    args = []
+    for i in range(1, n + 1):
+        desc = f"`violation_description_-_{i}`"
+        pts  = f"CAST(`violation_points_-_{i}` AS STRING)"
+        det  = f"`violation_detail_-_{i}`"
+        memo = f"`violation_memo_-_{i}`"
+        args.append(f"{desc}, {pts}, {det}, {memo}")
+    return (
+        f"stack({n}, {', '.join(args)}) "
+        f"as (raw_description, violation_points_str, violation_detail, inspector_comment)"
     )
 
-# Build stack expression with backtick-quoted names (hyphens require this)
-stack_expr = ", ".join([
-    f"`violation_description_-_{i}`, `violation_points_-_{i}`, `violation_detail_-_{i}`, `violation_memo_-_{i}`"
-    for i in range(1, 26)
-])
+DALLAS_CODE_PATTERN = r"^\*?(\d+)\s"
+DALLAS_DESC_PATTERN = r"^\*?\d+\s+(.+)$"
 
 dallas_violations = (
     dallas
-    .selectExpr(
-        "inspection_id",
-        "source_city",
-        f"stack(25, {stack_expr}) as (raw_description, violation_points, violation_detail, inspector_comment)"
-    )
+    .selectExpr("inspection_id", "source_city", build_dallas_stack_expr(25))
     .filter(col("raw_description").isNotNull())
-    .withColumn("violation_points",   expr("try_cast(violation_points AS INT)"))
-    .withColumn("violation_code",     expr(r"lpad(regexp_extract(raw_description, '^\*?(\d+)\s', 1), 2, '0')"))
-    .withColumn("violation_description", expr(r"trim(regexp_extract(raw_description, '^\*?\d+\s+(.+)$', 1))"))
+    .withColumn("violation_points", expr("try_cast(violation_points_str as int)"))
+    .drop("violation_points_str")
+    .withColumn("violation_code",
+        lpad(regexp_extract(col("raw_description"), DALLAS_CODE_PATTERN, 1), 2, "0"))
+    .withColumn("violation_description",
+        trim(regexp_extract(col("raw_description"), DALLAS_DESC_PATTERN, 1)))
+    .withColumn("violation_detail", col("violation_detail"))
     .drop("raw_description")
-    .select(
-        "inspection_id", "violation_code", "violation_description",
-        "violation_detail", "inspector_comment", "violation_points", "source_city"
-    )
-    .dropDuplicates(["inspection_id", "violation_code"])
+    .filter(col("violation_code") != "")
 )
 
 print("Dallas violations unpivoted:", dallas_violations.count())
-dallas_violations.show(5, truncate=False)
 
 
 # ──────────────────────────────────────────────────────────────
-# STEP 3 — Build dim_violation
+# STEP 3 — Save staging table
 # ──────────────────────────────────────────────────────────────
+
 all_violations = chicago_violations.unionByName(dallas_violations)
+
+all_violations.write \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("staging_all_violations")
+
+print("staging_all_violations rows:", all_violations.count())
+
+
+# ──────────────────────────────────────────────────────────────
+# STEP 4 — Build dim_violation
+# ──────────────────────────────────────────────────────────────
+# Grain: one row per (violation_code, violation_description, source_city)
 
 dim_violation = (
     all_violations
@@ -99,28 +113,12 @@ dim_violation = (
     .select("violation_sk", "violation_code", "violation_description", "violation_detail", "source_city")
 )
 
-dim_violation.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_violation")
-print("dim_violation rows:", dim_violation.count())
+dim_violation.write \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("dim_violation")
+
+print("dim_violation rows:", spark.table("dim_violation").count())
 spark.table("dim_violation").show(10, truncate=False)
 
-
-# ──────────────────────────────────────────────────────────────
-# STEP 4 — Build fact_inspection_violation (bridge table)
-# ──────────────────────────────────────────────────────────────
-dim_viol_lookup = spark.table("dim_violation").select(
-    "violation_sk", "violation_code", "violation_description", "source_city"
-)
-
-fact_inspection_violation = (
-    all_violations
-    .join(
-        dim_viol_lookup,
-        on=["violation_code", "violation_description", "source_city"],
-        how="left"
-    )
-    .select(
-        "inspection_id", "violation_sk", "violation_points",
-        "inspector_comment", "source_city"
-    )
-    .withColumn("insp_violation_sk", monotonically_increasing_id())
-)
+print("\n--- Next step: run gold_fact_inspection.py ---")
